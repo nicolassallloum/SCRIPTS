@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""
+Load a CSV (same schema) into Oracle, PostgreSQL, MySQL, and SQL Server.
+
+- PostgreSQL  : COPY FROM STDIN (fastest)
+- MySQL       : LOAD DATA LOCAL INFILE (fastest from client)
+- SQL Server  : BULK INSERT (fastest) with fallback to fast_executemany
+- Oracle      : Array DML with executemany (fast via Python driver)
+
+CSV must have header:
+Block_num,Trx_id,Timestamp,Amount,Contract_type,Currency,Event_name,From_Address,To_Address
+
+Usage examples:
+  python load_csv_to_rdbms.py --create        # create tables then load all
+  python load_csv_to_rdbms.py --only pg,mysql # load a subset
+  python load_csv_to_rdbms.py --rows 10000    # test with first 10k rows only
+
+Edit CONFIG below to point to your CSV file paths and DSNs.
+"""
+
+import argparse
+import csv
+import os
+import sys
+import time
+from pathlib import Path
+from datetime import datetime
+
+# -------------------- CONFIG --------------------
+CONFIG = {
+    "csvs": {
+        "oracle":   Path("/home/nicolas/multi-db-env/data/block_transactions_oracle.csv"),
+        "postgres": Path("/home/nicolas/multi-db-env/data/block_transactions_postgres.csv"),
+        "mysql":    Path("/home/nicolas/multi-db-env/data/block_transactions_mysql.csv"),
+
+        # MSSQL: server-side path (for BULK) + client-side path (for fallback)
+        "mssql_bulk":   "C:/bulk/block_transactions_mssql.csv",           # visible to SQL Server (Windows)
+        "mssql_client": Path("/home/nicolas/multi-db-env/data/block_transactions_mssql.csv"),  # visible to Ubuntu/Python
+    },
+    "oracle": {
+        # supports cx_Oracle or python-oracledb (thin or thick)
+        "dsn": {"user": "system", "password": "oracle", "dsn": "localhost:1521/XEPDB1"},
+        "table": "block_transactions",
+    },
+    "postgres": {
+        "dsn": "dbname=testdb user=admin password=admin host=127.0.0.1 port=5434",
+        "table": "block_transactions",
+        "schema": None,  # or "public"
+    },
+    "mysql": {
+        "dsn": {
+            "user": "root",
+            "password": "root",
+            "host": "127.0.0.1",
+            "database": "testdb",
+            "port": 3307,
+            "allow_local_infile": True,
+        },
+        "table": "block_transactions",
+    },
+    "mssql": {
+        "dsn": "DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost;DATABASE=master;UID=sa;PWD=Admin@12345;Encrypt=no",
+        "table": "block_transactions",
+    },
+}
+
+COLUMNS = [
+    "Block_num","Trx_id","Timestamp","Amount","Contract_type",
+    "Currency","Event_name","From_Address","To_Address"
+]
+def is_windows_path(s: str) -> bool:
+    # naive but effective for 'C:/...' or 'C:\\...'
+    return isinstance(s, str) and len(s) >= 2 and s[1] == ':' or (isinstance(s, str) and s.startswith("\\\\") or s.startswith("//"))
+
+def safe_exists(p) -> bool:
+    try:
+        return Path(p).exists()
+    except Exception:
+        return False
+# -------------------- UTIL --------------------
+def head_count(path: Path, limit_rows: int | None) -> int:
+    if limit_rows:
+        return limit_rows
+    # count lines quickly (minus header)
+    with path.open("rb") as f:
+        return max(0, sum(1 for _ in f) - 1)
+
+def ensure_exists(path, label: str):
+    """
+    Ensure a *client-side* path exists (Linux/WSL). Skip checks for pure Windows-only paths
+    that are meant to be read by SQL Server BULK on the server side.
+    """
+    # If it's a Windows path, skip local existence check (Ubuntu can't see it)
+    if isinstance(path, str) and is_windows_path(path):
+        return
+    if not safe_exists(path):
+        raise FileNotFoundError(f"{label} CSV not found at: {path}")
+
+# -------------------- CREATE TABLES --------------------
+def create_oracle():
+    try:
+        import oracledb as cx_oracle
+    except Exception:
+        import cx_Oracle as cx_oracle  # fallback
+    conn = cx_oracle.connect(**CONFIG["oracle"]["dsn"])
+    cur = conn.cursor()
+    tbl = CONFIG["oracle"]["table"]
+    cur.execute("""
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP TABLE block_transactions PURGE';
+    EXCEPTION WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN RAISE; END IF;
+    END;""")
+    cur.execute(f"""
+        CREATE TABLE {tbl} (
+          Block_num      NUMBER(10),
+          Trx_id         VARCHAR2(100),
+          "Timestamp"    TIMESTAMP,
+          Amount         NUMBER(20,8),
+          Contract_type  VARCHAR2(50),
+          Currency       VARCHAR2(10),
+          Event_name     VARCHAR2(100),
+          From_Address   VARCHAR2(100),
+          To_Address     VARCHAR2(100)
+        )
+    """)
+    conn.commit()
+    cur.close(); conn.close()
+
+def create_postgres():
+    import psycopg2
+    dsn = CONFIG["postgres"]["dsn"]
+    tbl = CONFIG["postgres"]["table"]
+    schema = CONFIG["postgres"]["schema"]
+    qname = f'"{tbl}"' if not schema else f'"{schema}"."{tbl}"'
+    conn = psycopg2.connect(dsn)
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute(f'DROP TABLE IF EXISTS {qname}')
+    cur.execute(f"""
+        CREATE TABLE {qname} (
+          "Block_num"      INTEGER,
+          "Trx_id"         VARCHAR(100),
+          "Timestamp"      TIMESTAMPTZ,
+          "Amount"         NUMERIC(20,8),
+          "Contract_type"  VARCHAR(50),
+          "Currency"       VARCHAR(10),
+          "Event_name"     VARCHAR(100),
+          "From_Address"   VARCHAR(100),
+          "To_Address"     VARCHAR(100)
+        )
+    """)
+    cur.close(); conn.close()
+
+def create_mysql():
+    import mysql.connector as mysql
+    conn = mysql.connect(**CONFIG["mysql"]["dsn"])
+    cur = conn.cursor()
+    tbl = CONFIG["mysql"]["table"]
+    cur.execute(f"DROP TABLE IF EXISTS `{tbl}`")
+    cur.execute(f"""
+        CREATE TABLE `{tbl}`(
+          `Block_num`     INT,
+          `Trx_id`        VARCHAR(100),
+          `Timestamp`     TIMESTAMP NULL,
+          `Amount`        DECIMAL(20,8),
+          `Contract_type` VARCHAR(50),
+          `Currency`      VARCHAR(10),
+          `Event_name`    VARCHAR(100),
+          `From_Address`  VARCHAR(100),
+          `To_Address`    VARCHAR(100)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
+    conn.commit()
+    cur.close(); conn.close()
+
+def create_mssql():
+    import pyodbc
+    cn = pyodbc.connect(CONFIG["mssql"]["dsn"], autocommit=True)
+    cur = cn.cursor()
+    tbl = CONFIG["mssql"]["table"]
+    cur.execute(f"IF OBJECT_ID(N'[dbo].[{tbl}]', N'U') IS NOT NULL DROP TABLE [dbo].[{tbl}]")
+    cur.execute(f"""
+        CREATE TABLE [dbo].[{tbl}](
+          [Block_num]     INT,
+          [Trx_id]        VARCHAR(100),
+          [Timestamp]     DATETIME2,
+          [Amount]        DECIMAL(20,8),
+          [Contract_type] VARCHAR(50),
+          [Currency]      VARCHAR(10),
+          [Event_name]    VARCHAR(100),
+          [From_Address]  VARCHAR(100),
+          [To_Address]    VARCHAR(100)
+        )
+    """)
+    cur.close(); cn.close()
+
+# -------------------- LOADERS --------------------
+def load_oracle(limit_rows: int | None):
+    # executemany with array binding
+    try:
+        import oracledb as cx_oracle
+    except Exception:
+        import cx_Oracle as cx_oracle
+    path = CONFIG["csvs"]["oracle"]; ensure_exists(path, "Oracle")
+    rows_target = head_count(path, limit_rows)
+
+    conn = cx_oracle.connect(**CONFIG["oracle"]["dsn"])
+    cur = conn.cursor()
+    # help timestamp parsing consistency
+    try:
+        cur.execute("ALTER SESSION SET NLS_TIMESTAMP_TZ_FORMAT = 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'")
+        cur.execute("ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD\"T\"HH24:MI:SS'")
+    except Exception:
+        pass
+
+    sql = f"""INSERT /*+ APPEND */ INTO {CONFIG["oracle"]["table"]}
+        (Block_num, Trx_id, "Timestamp", Amount, Contract_type, Currency, Event_name, From_Address, To_Address)
+        VALUES (:1,:2,:3,:4,:5,:6,:7,:8,:9)"""
+
+    batch, batch_size, count = [], 10_000, 0
+    t0 = time.time()
+    with path.open(newline="") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            if limit_rows and count >= limit_rows:
+                break
+            # strip trailing Z for Oracle TIMESTAMP (no TZ)
+            ts = row["Timestamp"].rstrip("Z")
+            batch.append((
+                int(row["Block_num"]),
+                row["Trx_id"],
+                datetime.fromisoformat(ts),
+                float(row["Amount"]),
+                row["Contract_type"],
+                row["Currency"],
+                row["Event_name"],
+                row["From_Address"],
+                row["To_Address"]
+            ))
+            count += 1
+            if len(batch) >= batch_size:
+                cur.executemany(sql, batch); batch.clear()
+        if batch:
+            cur.executemany(sql, batch)
+    conn.commit()
+    cur.close(); conn.close()
+    print(f"[Oracle] Loaded {count:,} rows in {time.time()-t0:,.1f}s")
+
+def load_postgres(limit_rows: int | None):
+    import psycopg2
+    path = CONFIG["csvs"]["postgres"]; ensure_exists(path, "PostgreSQL")
+    dsn = CONFIG["postgres"]["dsn"]; tbl = CONFIG["postgres"]["table"]; schema = CONFIG["postgres"]["schema"]
+    qname = f'"{tbl}"' if not schema else f'"{schema}"."{tbl}"'
+    rows_target = head_count(path, limit_rows)
+
+    conn = psycopg2.connect(dsn)
+    conn.autocommit = True
+    cur = conn.cursor()
+    t0 = time.time()
+
+    if limit_rows:
+        # copy N rows manually (simple & reliable for testing)
+        with path.open(newline="") as f:
+            rdr = csv.reader(f)
+            header = next(rdr)
+            # write to temp file with only N lines
+            tmp = Path(path.parent, f"tmp_{tbl}_{limit_rows}.csv")
+            with tmp.open("w", newline="") as out:
+                w = csv.writer(out); w.writerow(header)
+                for i, row in enumerate(rdr, start=1):
+                    if i > limit_rows: break
+                    w.writerow(row)
+            with tmp.open("r") as tf:
+                copy_sql = f'COPY {qname} ("' + '","'.join(COLUMNS) + '") FROM STDIN WITH (FORMAT csv, HEADER true)'
+                cur.copy_expert(copy_sql, tf)
+            tmp.unlink(missing_ok=True)
+    else:
+        with path.open("r") as f:
+            copy_sql = f'COPY {qname} ("' + '","'.join(COLUMNS) + '") FROM STDIN WITH (FORMAT csv, HEADER true)'
+            cur.copy_expert(copy_sql, f)
+
+    print(f"[PostgreSQL] Loaded {rows_target:,} rows in {time.time()-t0:,.1f}s")
+    cur.close(); conn.close()
+
+def load_mysql(limit_rows: int | None):
+    import mysql.connector as mysql
+    path = CONFIG["csvs"]["mysql"]; ensure_exists(path, "MySQL")
+    conn = mysql.connect(**CONFIG["mysql"]["dsn"])
+    cur = conn.cursor()
+    # allow LOCAL
+    try:
+        cur.execute("SET GLOBAL local_infile = 1")
+    except Exception:
+        pass
+    cur.execute("SET SESSION sql_mode=(SELECT REPLACE(@@sql_mode,'STRICT_TRANS_TABLES',''))")
+
+    tbl = CONFIG["mysql"]["table"]
+    rows_target = head_count(path, limit_rows)
+    t0 = time.time()
+
+    if limit_rows:
+        # write temp N-row CSV
+        with path.open(newline="") as f:
+            rdr = csv.reader(f)
+            header = next(rdr)
+            tmp = Path(path.parent, f"tmp_{tbl}_{limit_rows}.csv")
+            with tmp.open("w", newline="") as out:
+                w = csv.writer(out); w.writerow(header)
+                for i, row in enumerate(rdr, start=1):
+                    if i > limit_rows: break
+                    w.writerow(row)
+        load_path = tmp.as_posix()
+    else:
+        load_path = path.as_posix()
+
+    load_sql = f"""
+        LOAD DATA LOCAL INFILE '{load_path}'
+        INTO TABLE `{tbl}`
+        FIELDS TERMINATED BY ','
+        ENCLOSED BY '"'
+        LINES TERMINATED BY '\\n'
+        IGNORE 1 LINES
+        (`Block_num`,`Trx_id`,`Timestamp`,`Amount`,`Contract_type`,`Currency`,`Event_name`,`From_Address`,`To_Address`);
+    """
+    cur.execute(load_sql)
+    conn.commit()
+    if limit_rows:
+        Path(load_path).unlink(missing_ok=True)
+    print(f"[MySQL]  Loaded {rows_target:,} rows in {time.time()-t0:,.1f}s")
+    cur.close(); conn.close()
+
+def load_mssql(limit_rows: int | None):
+    import pyodbc, csv as _csv
+    # Client path (Ubuntu) for fallback; must exist locally
+    client_path = CONFIG["csvs"]["mssql_client"]
+    ensure_exists(client_path, "SQL Server (client CSV)")
+    rows_target = head_count(client_path, limit_rows)
+
+    # Server path (Windows) for BULK (SQL Server reads this); don't locally verify
+    bulk_server_path = CONFIG["csvs"]["mssql_bulk"]
+
+    cn = pyodbc.connect(CONFIG["mssql"]["dsn"], autocommit=True)
+    cur = cn.cursor()
+    t0 = time.time()
+
+    # If user limited rows, create a temp file on the client side for fallback
+    tmp_client_path = None
+    if limit_rows:
+        tmp_client_path = Path(Path(client_path).parent, f"tmp_mssql_{limit_rows}.csv")
+        with Path(client_path).open(newline="") as f_in, tmp_client_path.open("w", newline="") as f_out:
+            rdr = _csv.reader(f_in); w = _csv.writer(f_out)
+            header = next(rdr); w.writerow(header)
+            for i, row in enumerate(rdr, start=1):
+                if i > limit_rows: break
+                w.writerow(row)
+
+    # Try BULK INSERT first (SQL Server reads server path)
+    try:
+        bulk_path = bulk_server_path if not limit_rows else bulk_server_path  # server path wouldn't reflect the temp subset unless you copy there too
+        cur.execute(f"""
+            BULK INSERT [{CONFIG["mssql"]["table"]}]
+            FROM '{bulk_path}'
+            WITH (
+                FIRSTROW = 2,
+                FIELDTERMINATOR = ',',
+                ROWTERMINATOR = '\\n',
+                FORMAT = 'CSV',
+                TABLOCK,
+                KEEPNULLS,
+                CODEPAGE = 'RAW'
+            )
+        """)
+        elapsed = time.time() - t0
+        rps = (rows_target / elapsed) if elapsed > 0 else 0
+        print(f"[MSSQL]  BULK INSERT loaded {rows_target:,} rows in {elapsed:,.1f}s ({rps:,.0f} rows/sec)")
+        return
+    except pyodbc.Error as e:
+        print(f"[MSSQL]  BULK INSERT failed: {e}. Falling back to fast_executemany…")
+
+    # Fallback: fast_executemany reading from client path
+    cn2 = pyodbc.connect(CONFIG["mssql"]["dsn"]); cn2.autocommit = False
+    cur2 = cn2.cursor(); cur2.fast_executemany = True
+    sql = f"""INSERT INTO [{CONFIG["mssql"]["table"]}] 
+              ([Block_num],[Trx_id],[Timestamp],[Amount],[Contract_type],[Currency],[Event_name],[From_Address],[To_Address])
+              VALUES (?,?,?,?,?,?,?,?,?)"""
+    batch, batch_size, count = [], 10_000, 0
+    read_from = tmp_client_path if tmp_client_path else Path(client_path)
+
+    from datetime import datetime as _dt
+    with Path(read_from).open(newline="") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            if limit_rows and count >= limit_rows: break
+            ts = row["Timestamp"].rstrip("Z")
+            dt = _dt.fromisoformat(ts)  # pass real datetime for DATETIME2
+            batch.append([
+                int(row["Block_num"]),
+                row["Trx_id"],
+                dt,
+                float(row["Amount"]),
+                row["Contract_type"],
+                row["Currency"],
+                row["Event_name"],
+                row["From_Address"],
+                row["To_Address"],
+            ])
+            count += 1
+            if len(batch) >= batch_size:
+                cur2.executemany(sql, batch); cn2.commit(); batch.clear()
+        if batch:
+            cur2.executemany(sql, batch); cn2.commit()
+    elapsed = time.time() - t0
+    rps = (count / elapsed) if elapsed > 0 else 0
+    print(f"[MSSQL]  fast_executemany loaded {count:,} rows in {elapsed:,.1f}s ({rps:,.0f} rows/sec)")
+
+    cur2.close(); cn2.close()
+    if tmp_client_path:
+        tmp_client_path.unlink(missing_ok=True)
+    cur.close(); cn.close()
+# -------------------- MAIN --------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="Load CSVs into Oracle/PostgreSQL/MySQL/MSSQL.")
+    p.add_argument("--create", action="store_true", help="Create/replace tables before loading.")
+    p.add_argument("--only", type=str, default="oracle,postgres,mysql,mssql",
+                   help="Comma list of targets to run (oracle,postgres,mysql,mssql).")
+    p.add_argument("--rows", type=int, default=None, help="Limit rows per DB (for testing).")
+    return p.parse_args()
+
+def main():
+    args = parse_args()
+    targets = [t.strip().lower() for t in args.only.split(",") if t.strip()]
+
+    for t in targets:
+        if t not in ("oracle","postgres","mysql","mssql"):
+            print(f"Unknown target '{t}'. Allowed: oracle, postgres, mysql, mssql")
+            sys.exit(2)
+
+    global_start = time.time()
+
+    # CREATE
+    if args.create:
+        if "oracle" in targets:   print("[Oracle]  creating table…");   create_oracle()
+        if "postgres" in targets: print("[Postgres] creating table…");  create_postgres()
+        if "mysql" in targets:    print("[MySQL]   creating table…");   create_mysql()
+        if "mssql" in targets:    print("[MSSQL]   creating table…");   create_mssql()
+
+    # LOAD
+    if "oracle" in targets:   load_oracle(args.rows)
+    if "postgres" in targets: load_postgres(args.rows)
+    if "mysql" in targets:    load_mysql(args.rows)
+    if "mssql" in targets:    load_mssql(args.rows)
+
+    total_elapsed = time.time() - global_start
+    print("=" * 72)
+    print(f"All selected targets finished in {total_elapsed:,.1f}s ({total_elapsed/60:.2f} min)")
+    print("=" * 72)
+
+if __name__ == "__main__":
+    main()
