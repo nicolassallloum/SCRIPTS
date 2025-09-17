@@ -1,0 +1,2 @@
+--copy Folder
+scp -r ~/Downloads/split cassandra@172.31.13.148:/home/cassandra/Nix/
