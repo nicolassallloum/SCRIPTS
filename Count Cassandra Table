@@ -1,0 +1,33 @@
+import time
+from cassandra.cluster import Cluster
+
+# Start timer
+start_time = time.time()
+
+# Connect to the Cassandra cluster
+cluster = Cluster(["172.31.13.148"])
+session = cluster.connect("ledger")
+
+count = 0
+page_size = 1000
+
+# Prepare and bind the query
+query = "SELECT * FROM block_transactions_v2"
+statement = session.prepare(query)
+bound_statement = statement.bind([])  # ✅ Fix: bind with empty list
+bound_statement.fetch_size = page_size  # ✅ Set fetch size
+
+# Execute the query
+rs = session.execute(bound_statement)
+
+# Iterate through results and count
+for row in rs:
+    count += 1
+
+# End timer
+end_time = time.time()
+elapsed_time = end_time - start_time
+
+# Output result
+print(f"Total rows: {count}")
+print(f"Processing time: {elapsed_time:.2f} seconds")
