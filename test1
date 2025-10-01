@@ -1,0 +1,367 @@
+"""
+Hand Finger Size Engine — measures each finger length and approximate width (mm)
+
+Features
+- Live webcam hand tracking with MediaPipe Hands
+- Two calibration modes to convert pixels→millimeters:
+  1) ArUco marker (recommended; needs opencv-contrib) — print a single 4x4_50 ArUco with known side (default 50 mm)
+  2) Manual two‑point calibration — click two points, set known length (e.g., credit card width 85.6 mm)
+- Outputs per finger:
+  • Length from MCP→TIP (mm)
+  • Approx. width at mid‑phalanx using edge scan on Canny (mm)
+- Optional US ring size estimate from width (diameter) when width is measured reliably
+- Keyboard:
+  • q = quit
+  • a = toggle ArUco calibration on/off
+  • m = start manual calibration (click two points)
+  • r = reset calibration
+  • s = snapshot current measurements to CSV (./finger_measurements.csv)
+
+Dependencies
+  pip install opencv-contrib-python mediapipe numpy pandas
+
+Notes
+- For best accuracy, keep hand steady, palm down, good lighting, and camera ~25–40 cm from hand.
+- Edge‑based width needs contrast between skin and background; consider a dark matte background.
+- ArUco mode is most robust; print a marker with known side length in millimeters.
+"""
+import cv2
+import numpy as np
+import pandas as pd
+import time
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional, List
+
+try:
+    import mediapipe as mp
+    MP_AVAILABLE = True
+except Exception:
+    MP_AVAILABLE = False
+
+# --------------------- Utilities ---------------------
+
+FINGER_NAMES = ["Thumb", "Index", "Middle", "Ring", "Pinky"]
+# MediaPipe landmark indices per finger: (MCP, PIP, DIP, TIP); thumb is (CMC, MCP, IP, TIP)
+FINGER_LMS = {
+    "Thumb": (1, 2, 3, 4),
+    "Index": (5, 6, 7, 8),
+    "Middle": (9,10,11,12),
+    "Ring": (13,14,15,16),
+    "Pinky": (17,18,19,20),
+}
+
+@dataclass
+class Measurement:
+    length_mm: float
+    width_mm: Optional[float]  # width may be None if edge detection fails
+    ring_size_us: Optional[float]
+
+# Simple US ring size lookup (inner diameter, mm → US size). Interpolated.
+# Source: standard conversion tables.
+RING_TABLE = [
+    (11.54, 0.0), (11.74, 0.25), (11.95, 0.5), (12.15, 0.75), (12.36, 1.0),
+    (12.56, 1.25), (12.77, 1.5), (12.97, 1.75), (13.18, 2.0), (13.38, 2.25),
+    (13.59, 2.5), (13.79, 2.75), (14.00, 3.0), (14.20, 3.25), (14.41, 3.5),
+    (14.61, 3.75), (14.82, 4.0), (15.02, 4.25), (15.23, 4.5), (15.43, 4.75),
+    (15.64, 5.0), (15.84, 5.25), (16.05, 5.5), (16.26, 5.75), (16.46, 6.0),
+    (16.67, 6.25), (16.87, 6.5), (17.08, 6.75), (17.28, 7.0), (17.49, 7.25),
+    (17.70, 7.5), (17.90, 7.75), (18.11, 8.0), (18.31, 8.25), (18.52, 8.5),
+    (18.72, 8.75), (18.93, 9.0), (19.13, 9.25), (19.34, 9.5), (19.55, 9.75),
+    (19.75, 10.0), (19.96, 10.25), (20.16, 10.5), (20.37, 10.75), (20.57, 11.0),
+    (20.78, 11.25), (20.98, 11.5), (21.19, 11.75), (21.39, 12.0), (21.60, 12.25),
+    (21.80, 12.5), (22.01, 12.75), (22.22, 13.0)
+]
+
+def ring_size_from_diameter(d_mm: float) -> Optional[float]:
+    if not (10.5 <= d_mm <= 23.0):
+        return None
+    for i in range(len(RING_TABLE)-1):
+        (d0, s0), (d1, s1) = RING_TABLE[i], RING_TABLE[i+1]
+        if d0 <= d_mm <= d1:
+            t = (d_mm - d0) / (d1 - d0 + 1e-9)
+            return round(s0 + t * (s1 - s0), 2)
+    return None
+
+# --------------------- Calibration ---------------------
+
+class Calibrator:
+    def __init__(self, aruco_len_mm: float = 50.0):
+        self.mm_per_px: Optional[float] = None
+        self.mode_aruco: bool = False
+        self.aruco_len_mm = aruco_len_mm
+        self._manual_points: List[Tuple[int,int]] = []
+        self._known_len_mm: float = 85.6  # default (credit card width)
+        # Prepare ArUco if available in this OpenCV build
+        self._aruco = None
+        if hasattr(cv2, 'aruco'):
+            self._aruco = cv2.aruco
+            self._aruco_dict = self._aruco.getPredefinedDictionary(self._aruco.DICT_4X4_50)
+            self._aruco_params = self._aruco.DetectorParameters_create()
+
+    def reset(self):
+        self.mm_per_px = None
+        self._manual_points = []
+
+    def toggle_aruco(self):
+        if self._aruco is None:
+            print("[WARN] ArUco not available in your OpenCV build. Install opencv-contrib-python.")
+            self.mode_aruco = False
+        else:
+            self.mode_aruco = not self.mode_aruco
+            print(f"[INFO] ArUco calibration mode: {self.mode_aruco}")
+
+    def set_known_length_mm(self, mm: float):
+        self._known_len_mm = max(1.0, float(mm))
+
+    def on_mouse(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if len(self._manual_points) == 2:
+                self._manual_points = []
+            self._manual_points.append((x, y))
+
+    def try_aruco(self, frame: np.ndarray):
+        if not self.mode_aruco or self._aruco is None:
+            return
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = self._aruco.detectMarkers(gray, self._aruco_dict, parameters=self._aruco_params)
+        if ids is None or len(corners) == 0:
+            return
+        # Use the first marker detected
+        c = corners[0].reshape(-1, 2)
+        # Average of side lengths in pixels
+        side_px = (np.linalg.norm(c[0]-c[1]) + np.linalg.norm(c[1]-c[2]) +
+                   np.linalg.norm(c[2]-c[3]) + np.linalg.norm(c[3]-c[0])) / 4.0
+        if side_px > 10:
+            self.mm_per_px = self.aruco_len_mm / side_px
+
+    def draw_manual(self, frame: np.ndarray):
+        # Draw selected points/line
+        for pt in self._manual_points:
+            cv2.circle(frame, pt, 5, (0, 255, 255), -1)
+        if len(self._manual_points) == 2:
+            cv2.line(frame, self._manual_points[0], self._manual_points[1], (0, 255, 255), 2)
+            d_px = np.linalg.norm(np.array(self._manual_points[0]) - np.array(self._manual_points[1]))
+            if d_px > 1:
+                self.mm_per_px = self._known_len_mm / d_px
+
+# --------------------- Hand Measurement ---------------------
+
+class HandMeasurer:
+    def __init__(self, max_hands: int = 1):
+        if not MP_AVAILABLE:
+            raise RuntimeError("mediapipe not installed. Run `pip install mediapipe`.")
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(static_image_mode=False,
+                                         max_num_hands=max_hands,
+                                         min_detection_confidence=0.5,
+                                         min_tracking_confidence=0.5)
+        self.mp_draw = mp.solutions.drawing_utils
+        self.draw_styles = mp.solutions.drawing_styles
+
+    def detect(self, frame_bgr: np.ndarray):
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        return self.hands.process(rgb)
+
+    def landmark_xy(self, hand_landmarks, w: int, h: int) -> Dict[int, Tuple[int,int]]:
+        pts = {}
+        for i, lm in enumerate(hand_landmarks.landmark):
+            pts[i] = (int(lm.x * w), int(lm.y * h))
+        return pts
+
+    def finger_lengths(self, pts: Dict[int, Tuple[int,int]], mm_per_px: float) -> Dict[str, float]:
+        out = {}
+        for name, (a, b, c, d) in FINGER_LMS.items():
+            p0, p1, p2, p3 = np.array(pts[a]), np.array(pts[b]), np.array(pts[c]), np.array(pts[d])
+            length_px = np.linalg.norm(p1 - p0) + np.linalg.norm(p2 - p1) + np.linalg.norm(p3 - p2)
+            out[name] = float(length_px * mm_per_px)
+        return out
+
+    def finger_midpoints_dirs(self, pts: Dict[int, Tuple[int,int]]):
+        # For width estimate at mid‑phalanx (PIP↔DIP)
+        info = {}
+        for name, (a, b, c, d) in FINGER_LMS.items():
+            p1, p2 = np.array(pts[b], dtype=np.float32), np.array(pts[c], dtype=np.float32)
+            mid = (p1 + p2) / 2.0
+            v = p2 - p1
+            if np.linalg.norm(v) < 1e-3:
+                continue
+            # perpendicular
+            u = np.array([-v[1], v[0]])
+            u = u / (np.linalg.norm(u) + 1e-9)
+            info[name] = (mid, u)
+        return info
+
+    def width_via_edges(self, gray: np.ndarray, mid: np.ndarray, u: np.ndarray, max_scan_px=60) -> Optional[float]:
+        # Scan along ±u from mid until hitting Canny edge
+        edges = cv2.Canny(gray, 50, 150)
+        h, w = edges.shape
+        def first_edge(sign):
+            for t in range(2, max_scan_px):
+                x = int(round(mid[0] + sign * t * u[0]))
+                y = int(round(mid[1] + sign * t * u[1]))
+                if x < 0 or y < 0 or x >= w or y >= h:
+                    break
+                if edges[y, x] != 0:
+                    return t
+            return None
+        t1 = first_edge(+1)
+        t2 = first_edge(-1)
+        if t1 is None or t2 is None:
+            return None
+        return float(t1 + t2)  # width in pixels
+
+# --------------------- Main Engine ---------------------
+
+class HandSizeEngine:
+    def __init__(self, camera_id: int = 0, aruco_len_mm: float = 50.0, max_hands: int = 1):
+        self.cap = cv2.VideoCapture(camera_id)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Cannot open camera {camera_id}")
+        self.calib = Calibrator(aruco_len_mm=aruco_len_mm)
+        self.measurer = HandMeasurer(max_hands=max_hands)
+        self.out_rows: List[Dict] = []
+        self.window = "Hand Size Engine"
+        cv2.namedWindow(self.window)
+        cv2.setMouseCallback(self.window, self._on_mouse)
+        # UI state
+        self.manual_calibrating = False
+
+    def _on_mouse(self, event, x, y, flags, param):
+        if self.manual_calibrating:
+            self.calib.on_mouse(event, x, y, flags, param)
+
+    def _draw_hud(self, frame: np.ndarray):
+        mmpp = self.calib.mm_per_px
+        status = f"mm/px: {mmpp:.4f}" if mmpp else "mm/px: (not set)"
+        mode = "ARUCO" if self.calib.mode_aruco else ("MANUAL" if self.manual_calibrating else "IDLE")
+        cv2.rectangle(frame, (0,0), (frame.shape[1], 60), (0,0,0), -1)
+        cv2.putText(frame, f"Mode: {mode} | {status}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,255), 2)
+        cv2.putText(frame, "Keys: q=quit  a=ArUco  m=Manual calib  r=reset  s=snapshot", (10, frame.shape[0]-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+        if self.manual_calibrating:
+            cv2.putText(frame, f"Click two points, known length={self.calib._known_len_mm:.1f} mm (drag slider)",
+                        (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+
+    def _ensure_manual_ui(self):
+        if not self.manual_calibrating:
+            return
+        # Trackbar for known length
+        def _on_trackbar(val):
+            self.calib.set_known_length_mm(float(val))
+        if cv2.getTrackbarPos('known_mm', self.window) == -1:
+            pass  # not reliable to detect; create every time for simplicity
+        cv2.createTrackbar('known_mm', self.window, int(round(self.calib._known_len_mm)), 200, _on_trackbar)
+        cv2.setTrackbarPos('known_mm', self.window, int(round(self.calib._known_len_mm)))
+
+    def _snapshot(self, measurements: Dict[str, Measurement]):
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        row = {"timestamp": ts}
+        for name in FINGER_NAMES:
+            m = measurements.get(name)
+            if m is None:
+                continue
+            row[f"{name}_length_mm"] = round(m.length_mm, 2)
+            row[f"{name}_width_mm"] = round(m.width_mm, 2) if m.width_mm is not None else None
+            row[f"{name}_ring_us"] = m.ring_size_us
+        self.out_rows.append(row)
+        df = pd.DataFrame(self.out_rows)
+        df.to_csv("finger_measurements.csv", index=False)
+        print("[INFO] Snapshot saved → finger_measurements.csv")
+
+    def start(self):
+        print("[INFO] Starting. Press 'a' for ArUco calibration or 'm' for manual; 'q' to quit.")
+        while True:
+            ok, frame = self.cap.read()
+            if not ok:
+                break
+            frame = cv2.flip(frame, 1)
+            h, w = frame.shape[:2]
+
+            # Calibration
+            if self.calib.mode_aruco:
+                self.calib.try_aruco(frame)
+            if self.manual_calibrating:
+                self.calib.draw_manual(frame)
+                self._ensure_manual_ui()
+
+            # Hand detection
+            results = self.measurer.detect(frame)
+            measurements: Dict[str, Measurement] = {}
+
+            if results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    # draw landmarks
+                    self.measurer.mp_draw.draw_landmarks(
+                        frame,
+                        hand_landmarks,
+                        self.measurer.mp_hands.HAND_CONNECTIONS,
+                        self.measurer.draw_styles.get_default_hand_landmarks_style(),
+                        self.measurer.draw_styles.get_default_hand_connections_style(),
+                    )
+                    pts = self.measurer.landmark_xy(hand_landmarks, w, h)
+
+                    if self.calib.mm_per_px:
+                        # lengths
+                        lengths = self.measurer.finger_lengths(pts, self.calib.mm_per_px)
+                        # widths
+                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        info = self.measurer.finger_midpoints_dirs(pts)
+                        for name in FINGER_NAMES:
+                            length = lengths.get(name)
+                            width_mm = None
+                            ring_us = None
+                            if name in info:
+                                mid, u = info[name]
+                                width_px = self.measurer.width_via_edges(gray, mid, u)
+                                if width_px is not None:
+                                    width_mm = width_px * self.calib.mm_per_px
+                                    ring_us = ring_size_from_diameter(width_mm)
+                                # draw mid and ray
+                                mxy = (int(mid[0]), int(mid[1]))
+                                cv2.circle(frame, mxy, 4, (0, 255, 0), -1)
+                                p1 = (int(mid[0] + u[0]*50), int(mid[1] + u[1]*50))
+                                p2 = (int(mid[0] - u[0]*50), int(mid[1] - u[1]*50))
+                                cv2.line(frame, p1, p2, (0, 255, 0), 1)
+                            if length is not None:
+                                measurements[name] = Measurement(length_mm=length, width_mm=width_mm, ring_size_us=ring_us)
+
+            # HUD and overlay numbers
+            self._draw_hud(frame)
+            y0 = 110
+            for i, name in enumerate(FINGER_NAMES):
+                m = measurements.get(name)
+                text = f"{name}:"
+                if m:
+                    text += f" L={m.length_mm:.1f}mm"
+                    if m.width_mm:
+                        text += f"  W={m.width_mm:.1f}mm"
+                    if m.ring_size_us:
+                        text += f"  US~{m.ring_size_us}"
+                cv2.putText(frame, text, (10, y0 + i*28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+
+            cv2.imshow(self.window, frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('a'):
+                self.calib.toggle_aruco()
+                self.manual_calibrating = False
+            elif key == ord('m'):
+                self.manual_calibrating = True
+                self.calib.mode_aruco = False
+                self.calib.reset()
+            elif key == ord('r'):
+                self.calib.reset()
+            elif key == ord('s'):
+                if measurements and self.calib.mm_per_px:
+                    self._snapshot(measurements)
+                else:
+                    print("[WARN] Cannot snapshot without calibration + detection.")
+
+        self.cap.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    engine = HandSizeEngine(camera_id=0, aruco_len_mm=50.0, max_hands=1)
+    engine.start()
