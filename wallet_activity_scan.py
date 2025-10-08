@@ -19,10 +19,16 @@ from core.contract.asset_issue_contract_pb2 import TransferAssetContract
 # ========== EDIT THESE CONSTANTS ==========
 NODE = "127.0.0.1:50051"          # gRPC node
 WALLET = "TEf3PqyXoquJnkefR8S1dd5838zwBbKvkg"  # Base58 (T...) OR hex (with/without 0x / 0x41 prefix)
-START_BLOCK = 0
-END_BLOCK = 76000000
+
+# Scan control:
+START_FROM = 0                    # resume point (inclusive)
+SCAN_TO_LATEST = True             # if True, auto-set end to node's latest block height
+END_BLOCK = None                  # ignored when SCAN_TO_LATEST = True
+
+# Concurrency and output:
 MAX_WORKERS = 10
 INCLUDE_EMPTY_BLOCKS = False
+STREAM_MODE = True                # True => NDJSON per block + final summary (recommended for full-chain scans)
 # =========================================
 
 GRPC_MAX_MSG = 100 * 1024 * 1024  # 100MB for large blocks
@@ -212,14 +218,25 @@ def process_transaction_info(stub: WalletStub, txid: str, block_number: int, blo
     return filtered
 
 
+# ---------------- Helpers for latest height ----------------
+def get_latest_block_number(stub: WalletStub) -> int:
+    # GetNowBlock returns the latest block; read its header number
+    latest_block = stub.GetNowBlock(NumberMessage(num=0))
+    return latest_block.block_header.raw_data.number
+
+
 # ---------------- Block scanner (wallet-filtered) ----------------
-def scan_block_range_for_wallet(node: str, wallet20: bytes, wallet_b58: str,
-                                start_block: int, end_block: int,
-                                max_workers: int, include_empty_blocks: bool):
+def scan_blocks_for_wallet(node: str, wallet20: bytes, wallet_b58: str,
+                           start_block: int, end_block: Optional[int],
+                           max_workers: int, include_empty_blocks: bool,
+                           stream_mode: bool):
     channel = grpc.insecure_channel(node, options=[('grpc.max_receive_message_length', GRPC_MAX_MSG)])
     stub = WalletStub(channel)
 
-    all_block_results = []
+    # Resolve end height if needed
+    if end_block is None:
+        end_block = get_latest_block_number(stub)
+
     summary = {
         "wallet": wallet_b58,
         "scanned_blocks": 0,
@@ -234,6 +251,9 @@ def scan_block_range_for_wallet(node: str, wallet20: bytes, wallet_b58: str,
         "fees_sun": 0
     }
     seen_txids = set()
+
+    # When not streaming, we collect blocks (beware of memory)
+    collected_blocks = [] if not stream_mode else None
 
     for height in range(start_block, end_block + 1):
         try:
@@ -347,40 +367,76 @@ def scan_block_range_for_wallet(node: str, wallet20: bytes, wallet_b58: str,
             if block_result["events"]:
                 block_result["wallet_events_count"] = len(block_result["events"])
                 block_result["wallet_tx_count"] = len({e["txid"] for e in block_result["events"]})
-                all_block_results.append(block_result)
-            elif include_empty_blocks:
-                all_block_results.append(block_result)
 
+            # Update running totals
             summary["scanned_blocks"] += 1
             summary["total_events"] += block_result["wallet_events_count"]
+
+            # Emit/store
+            if stream_mode:
+                if block_result["events"] or include_empty_blocks:
+                    print(json.dumps({"block": block_result}, ensure_ascii=False), flush=True)
+            else:
+                if block_result["events"] or include_empty_blocks:
+                    collected_blocks.append(block_result)
 
         except grpc.RpcError as e:
             print(f"RPC Error fetching block {height}: {e.details()}", file=sys.stderr)
         except Exception as e:
             print(f"Unexpected error processing block {height}: {e}", file=sys.stderr)
 
-    summary["unique_txids"] = len(seen_txids)
-
-    out = {
+    # Final output
+    summary_out = {
         "wallet": wallet_b58,
         "start_block": start_block,
         "end_block": end_block,
-        "summary": summary,
-        "blocks": all_block_results
+        "summary": {
+            "wallet": summary["wallet"],
+            "scanned_blocks": summary["scanned_blocks"],
+            "unique_txids": len(seen_txids),
+            "total_events": summary["total_events"],
+            "trx_sun_in": summary["trx_sun_in"],
+            "trx_sun_out": summary["trx_sun_out"],
+            "trc10_in": summary["trc10_in"],
+            "trc10_out": summary["trc10_out"],
+            "trc20_in": summary["trc20_in"],
+            "trc20_out": summary["trc20_out"],
+            "fees_sun": summary["fees_sun"],
+        }
     }
-    print(json.dumps(out, ensure_ascii=False, indent=2))
-    print(f"[SUMMARY] Scanned blocks={summary['scanned_blocks']}, unique_tx={summary['unique_txids']}, events_total={summary['total_events']}")
+
+    if stream_mode:
+        # Print final summary as a separate JSON line
+        print(json.dumps({"summary": summary_out}, ensure_ascii=False, indent=2))
+        print(f"[SUMMARY] Scanned blocks={summary_out['summary']['scanned_blocks']}, unique_tx={summary_out['summary']['unique_txids']}, events_total={summary_out['summary']['total_events']}")
+    else:
+        out = {
+            "wallet": wallet_b58,
+            "start_block": start_block,
+            "end_block": end_block,
+            "summary": summary_out["summary"],
+            "blocks": collected_blocks
+        }
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        print(f"[SUMMARY] Scanned blocks={summary_out['summary']['scanned_blocks']}, unique_tx={summary_out['summary']['unique_txids']}, events_total={summary_out['summary']['total_events']}")
 
 
 # ---------------- Entry point ----------------
 if __name__ == '__main__':
     wallet20, wallet_b58 = normalize_wallet_input(WALLET)
-    scan_block_range_for_wallet(
+
+    # Resolve end height when scanning "all blocks"
+    end = None
+    if not SCAN_TO_LATEST:
+        end = END_BLOCK
+
+    scan_blocks_for_wallet(
         node=NODE,
         wallet20=wallet20,
         wallet_b58=wallet_b58,
-        start_block=START_BLOCK,
-        end_block=END_BLOCK,
+        start_block=START_FROM,
+        end_block=end,
         max_workers=MAX_WORKERS,
-        include_empty_blocks=INCLUDE_EMPTY_BLOCKS
+        include_empty_blocks=INCLUDE_EMPTY_BLOCKS,
+        stream_mode=STREAM_MODE
     )
