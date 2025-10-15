@@ -1,0 +1,319 @@
+cat > cass_to_ch.py <<'PY'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Copy data from Cassandra to ClickHouse (native TCP or HTTP).
+
+Install:
+  pip install -U cassandra-driver clickhouse-driver clickhouse-connect tqdm
+
+Examples:
+
+# HTTP on 8123 (no TLS)
+python cass_to_ch.py \
+  --src-host 172.31.13.151 --src-port 9042 \
+  --keyspace trc --table trc20_crypto_transfers \
+  --dst-host 172.31.13.93 --dst-port 8123 --protocol http \
+  --ch-username default --ch-password test \
+  --database mydb --dst-table trc20_crypto_transfers \
+  --fetch-size 5000 --batch-size 5000 --create-table
+
+# HTTPS on 8123 (self-signed: add --insecure)
+python cass_to_ch.py \
+  --src-host 172.31.13.151 --src-port 9042 \
+  --keyspace trc --table trc20_crypto_transfers \
+  --dst-host 172.31.13.93 --dst-port 8123 --protocol http --secure --insecure \
+  --ch-username default --ch-password test \
+  --database mydb --dst-table trc20_crypto_transfers \
+  --fetch-size 5000 --batch-size 5000 --create-table
+
+# Native TCP (port 9000) - fastest when available
+python cass_to_ch.py \
+  --src-host 172.31.13.151 --src-port 9042 \
+  --keyspace trc --table trc20_crypto_transfers \
+  --dst-host 172.31.13.93 --dst-port 9000 --protocol native \
+  --database mydb --dst-table trc20_crypto_transfers \
+  --fetch-size 5000 --batch-size 5000 --create-table
+"""
+
+import argparse
+import sys
+from decimal import Decimal
+from datetime import datetime, date
+from typing import Any, Iterable, List, Sequence, Tuple
+
+from cassandra.cluster import Cluster
+from cassandra.policies import TokenAwarePolicy, DCAwareRoundRobinPolicy
+from cassandra.auth import PlainTextAuthProvider
+from cassandra.query import SimpleStatement, dict_factory
+
+from tqdm import tqdm
+
+
+# ---------- Cassandra -> ClickHouse type mapping ----------
+
+CASS_TO_CH_TYPES = {
+    'ascii': 'String',
+    'text': 'String',
+    'varchar': 'String',
+    'tinyint': 'Int8',
+    'smallint': 'Int16',
+    'int': 'Int32',
+    'bigint': 'Int64',
+    'counter': 'Int64',
+    'varint': 'Int64',
+    'boolean': 'UInt8',
+    'float': 'Float32',
+    'double': 'Float64',
+    'decimal': 'Decimal(38,10)',
+    'uuid': 'String',
+    'timeuuid': 'String',
+    'timestamp': 'DateTime64(3)',
+    'date': 'Date',
+    'blob': 'String',
+    'inet': 'String',
+    'list': 'Array',
+    'set': 'Array',
+    'map': 'JSON',   # becomes String unless --map-as-json
+    'tuple': 'JSON',
+}
+
+def map_cassandra_to_clickhouse(cql_type_str: str, opts) -> str:
+    s = str(cql_type_str).lower()
+    if s.startswith('list<') or s.startswith('set<'):
+        inner = s[s.find('<')+1:s.rfind('>')].strip()
+        inner_mapped = map_cassandra_to_clickhouse(inner, opts)
+        return f'Array({inner_mapped})'
+    if s.startswith('map<') or s.startswith('tuple<'):
+        return 'String' if not getattr(opts, 'map_as_json', False) else 'JSON'
+    for base, ch in CASS_TO_CH_TYPES.items():
+        if s.startswith(base):
+            if ch == 'JSON':
+                return 'String' if not getattr(opts, 'map_as_json', False) else 'JSON'
+            return ch
+    return 'String'
+
+
+def cass_value_to_ch(val: Any) -> Any:
+    if isinstance(val, (datetime, date)):
+        return val
+    if isinstance(val, Decimal):
+        return str(val)  # safer for Decimal ingestion
+    if isinstance(val, bytes):
+        return val.hex()  # hex-encode blobs to String
+    if isinstance(val, (list, tuple)):
+        return [cass_value_to_ch(x) for x in val]
+    if isinstance(val, dict):
+        import json
+        return json.dumps({str(k): cass_value_to_ch(v) for k, v in val.items()}, ensure_ascii=False)
+    return val
+
+
+# ---------- ClickHouse client abstraction (native or http) ----------
+
+class ClickHouseNative:
+    """clickhouse-driver (native TCP: 9000/9440)."""
+    def __init__(self, host, port, username, password, secure):
+        from clickhouse_driver import Client as CHClient
+        self.client = CHClient(host=host, port=port, user=username, password=password,
+                               secure=secure, settings={'use_numpy': False})
+
+    def ensure_database(self, database: str):
+        self.exec(f'CREATE DATABASE IF NOT EXISTS `{database}`')
+
+    def exec(self, sql: str):
+        return self.client.execute(sql)
+
+    def insert_rows(self, database: str, table: str, columns: List[str], rows: List[Sequence[Any]]):
+        collist = ', '.join([f'`{c}`' for c in columns])
+        query = f'INSERT INTO `{database}`.`{table}` ({collist}) VALUES'
+        self.client.execute(query, rows)
+
+
+class ClickHouseHTTP:
+    """clickhouse-connect (HTTP/HTTPS: 8123/8443 or via reverse proxy)."""
+    def __init__(self, host, port, username, password, secure, verify=True):
+        from clickhouse_connect import get_client as get_ch_client
+        self.client = get_ch_client(
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            secure=bool(secure),   # True => HTTPS
+            verify=bool(verify)    # False => skip cert verify (self-signed)
+        )
+
+    def ensure_database(self, database: str):
+        self.exec(f'CREATE DATABASE IF NOT EXISTS `{database}`')
+
+    def exec(self, sql: str):
+        return self.client.command(sql)
+
+    def insert_rows(self, database: str, table: str, columns: List[str], rows: List[Sequence[Any]]):
+        self.client.insert(f'{database}.{table}', rows, column_names=columns)
+
+
+def resolve_protocol(protocol: str, port: int) -> str:
+    if protocol and protocol.lower() in ('native', 'http'):
+        return protocol.lower()
+    # auto by port
+    return 'http' if port in (8123, 8443, 443) else 'native'
+
+
+# ---------- DDL ----------
+
+def build_ch_create_table(columns: List[Tuple[str, str]],
+                          primary_keys: List[str],
+                          database: str,
+                          dst_table: str,
+                          engine: str = 'MergeTree') -> str:
+    cols = ',\n  '.join([f'`{name}` {ctype}' for name, ctype in columns])
+    # ORDER BY must be a tuple when multiple keys
+    if primary_keys and len(primary_keys) > 1:
+        order_expr = '(' + ', '.join(f'`{k}`' for k in primary_keys) + ')'
+    elif primary_keys:
+        order_expr = f'`{primary_keys[0]}`'
+    else:
+        order_expr = f'`{columns[0][0]}`'  # fallback to first column
+    ddl = f'''CREATE TABLE IF NOT EXISTS `{database}`.`{dst_table}` (
+  {cols}
+) ENGINE = {engine}
+ORDER BY {order_expr}'''
+    return ddl
+
+
+# ---------- Extraction ----------
+
+def read_cassandra_rows(session, keyspace: str, table: str,
+                        columns: List[str], fetch_size: int, where: str = None) -> Iterable[Sequence[Any]]:
+    collist = ', '.join([f'"{c}"' for c in columns])
+    q = f'SELECT {collist} FROM "{keyspace}"."{table}"'
+    if where:
+        q += f' WHERE {where}'
+    stmt = SimpleStatement(q, fetch_size=fetch_size)
+    for row in session.execute(stmt):
+        # row is a dict (dict_factory)
+        yield [row[c] for c in columns]
+
+
+# ---------- Main ----------
+
+def main():
+    parser = argparse.ArgumentParser(description='Copy data from Cassandra to ClickHouse (native or http)')
+    # Cassandra
+    parser.add_argument('--src-host', required=True, help='Cassandra host')
+    parser.add_argument('--src-port', type=int, default=9042)
+    parser.add_argument('--username', help='Cassandra username')
+    parser.add_argument('--password', help='Cassandra password')
+    parser.add_argument('--keyspace', required=True)
+    parser.add_argument('--table', required=True)
+    parser.add_argument('--fetch-size', type=int, default=5000)
+    parser.add_argument('--where', help='Optional WHERE clause without "WHERE"')
+    # ClickHouse
+    parser.add_argument('--dst-host', required=True, help='ClickHouse host')
+    parser.add_argument('--dst-port', type=int, default=9000, help='Native default 9000; HTTP default 8123')
+    parser.add_argument('--protocol', choices=['auto', 'native', 'http'], default='auto',
+                        help='auto (default), native, or http')
+    parser.add_argument('--secure', action='store_true',
+                        help='Native TLS (e.g., 9440) or HTTP->HTTPS (e.g., 8123/8443/443)')
+    parser.add_argument('--insecure', action='store_true',
+                        help='(HTTP/HTTPS only) Disable TLS certificate verification')
+    parser.add_argument('--ch-username', default='default')
+    parser.add_argument('--ch-password', default='')
+    parser.add_argument('--database', required=True)
+    parser.add_argument('--dst-table', required=True)
+    parser.add_argument('--create-table', action='store_true', help='Auto-create ClickHouse table via mapped types')
+    parser.add_argument('--engine', default='MergeTree', help='ClickHouse engine for --create-table')
+    parser.add_argument('--map-as-json', action='store_true', help='Store Cassandra maps/tuples as JSON (String otherwise)')
+    # Performance
+    parser.add_argument('--batch-size', type=int, default=5000)
+    parser.add_argument('--max-rows', type=int, default=0, help='Limit rows copied (0 = all)')
+    args = parser.parse_args()
+
+    # --- Connect to Cassandra ---
+    auth = PlainTextAuthProvider(username=args.username, password=args.password) if args.username else None
+    cluster = Cluster(
+        [args.src_host],
+        port=args.src_port,
+        auth_provider=auth,
+        load_balancing_policy=TokenAwarePolicy(DCAwareRoundRobinPolicy())
+    )
+    session = cluster.connect()
+    session.row_factory = dict_factory  # ensure rows are dicts
+
+    md = cluster.metadata
+    if args.keyspace not in md.keyspaces:
+        print(f'Keyspace "{args.keyspace}" not found', file=sys.stderr)
+        sys.exit(2)
+    ks_meta = md.keyspaces[args.keyspace]
+    if args.table not in ks_meta.tables:
+        print(f'Table "{args.keyspace}.{args.table}" not found', file=sys.stderr)
+        sys.exit(2)
+    tbl_meta = ks_meta.tables[args.table]
+
+    # Column order: partition + clustering + regular (stable ordering)
+    partition_keys = [c.name for c in tbl_meta.partition_key]
+    clustering_keys = [c.name for c in tbl_meta.clustering_key]
+    regular_cols = [c.name for c in tbl_meta.columns.values() if c.name not in partition_keys + clustering_keys]
+    columns = partition_keys + clustering_keys + regular_cols
+
+    # ClickHouse client (native or http)
+    proto = resolve_protocol(args.protocol, args.dst_port)
+    if proto == 'native':
+        ch = ClickHouseNative(args.dst_host, args.dst_port, args.ch_username, args.ch_password, args.secure)
+    else:
+        ch = ClickHouseHTTP(args.dst_host, args.dst_port, args.ch_username, args.ch_password,
+                            args.secure, verify=(not args.insecure))
+
+    # Ensure database exists
+    ch.ensure_database(args.database)
+
+    # Create table (optional)
+    if args.create_table:
+        mapped_cols: List[Tuple[str, str]] = []
+        for cname in columns:
+            cmeta = tbl_meta.columns[cname]
+            cql_type_str = str(getattr(cmeta, 'cql_type', 'text')).lower()
+            ch_type = map_cassandra_to_clickhouse(cql_type_str, args)
+            mapped_cols.append((cname, ch_type))
+        ddl = build_ch_create_table(mapped_cols, partition_keys + clustering_keys,
+                                    database=args.database, dst_table=args.dst_table, engine=args.engine)
+        ch.exec(ddl)
+
+    # Extract & load
+    total = 0
+    batch: List[List[Any]] = []
+    iterator = read_cassandra_rows(session, args.keyspace, args.table, columns, args.fetch_size, args.where)
+    pbar = tqdm(desc='Copying rows', unit='rows')
+    for row in iterator:
+        out = [cass_value_to_ch(v) for v in row]
+        batch.append(out)
+        if len(batch) >= args.batch_size:
+            ch.insert_rows(args.database, args.dst_table, columns, batch)
+            total += len(batch)
+            pbar.update(len(batch))
+            batch.clear()
+            if args.max_rows and total >= args.max_rows:
+                break
+
+    # Flush remainder
+    if batch and (not args.max_rows or total < args.max_rows):
+        if args.max_rows and total + len(batch) > args.max_rows:
+            batch = batch[: max(0, args.max_rows - total)]
+        if batch:
+            ch.insert_rows(args.database, args.dst_table, columns, batch)
+            pbar.update(len(batch))
+            total += len(batch)
+
+    pbar.close()
+    print(f'Done. Copied {total} rows.')
+
+    # Cleanup
+    cluster.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+PY
+chmod +x cass_to_ch.py
