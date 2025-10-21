@@ -1,0 +1,63 @@
+# Cat age -> human-equivalent days
+# Works on any online Python runner (stdin prompts, no external deps)
+
+from datetime import date, datetime
+
+AVG_DAYS_PER_YEAR = 365.2425  # Gregorian mean
+
+def cat_years_to_human_years(cat_years: float) -> float:
+    """Piecewise-linear mapping commonly used by vets:
+       0-1 cat years  -> up to 15 human years
+       1-2 cat years  -> +9 human years (total 24 at 2y)
+       >2 cat years   -> +4 human years per cat year
+    """
+    if cat_years <= 0:
+        return 0.0
+    if cat_years <= 1:
+        return 15.0 * cat_years
+    if cat_years <= 2:
+        return 15.0 + 9.0 * (cat_years - 1.0)
+    return 24.0 + 4.0 * (cat_years - 2.0)
+
+def parse_iso(d: str) -> date:
+    try:
+        return date.fromisoformat(d)
+    except Exception:
+        raise ValueError("Invalid date. Use YYYY-MM-DD (e.g., 2023-09-01).")
+
+def compute(dob: date, as_of: date | None = None):
+    today = as_of or date.today()
+    if dob > today:
+        raise ValueError("Date of birth cannot be in the future.")
+    cat_days = (today - dob).days
+    cat_years = cat_days / AVG_DAYS_PER_YEAR
+    human_years = cat_years_to_human_years(cat_years)
+    human_days = int(round(human_years * AVG_DAYS_PER_YEAR))
+    return {
+        "as_of": today,
+        "cat_days": cat_days,
+        "cat_years": cat_years,
+        "human_years": human_years,
+        "human_days": human_days,
+    }
+
+def main():
+    print("=== Cat Age → Human-Equivalent Days ===")
+    dob_str = input("Enter cat DOB (YYYY-MM-DD): ").strip()
+    asof_str = input("Enter reference date (YYYY-MM-DD) or leave blank for today: ").strip()
+
+    try:
+        dob = parse_iso(dob_str)
+        as_of = parse_iso(asof_str) if asof_str else None
+        result = compute(dob, as_of)
+
+        print("\n--- Result ---")
+        print(f"As of:            {result['as_of'].isoformat()}")
+        print(f"Cat DOB:          {dob.isoformat()}")
+        print(f"Cat age:          {result['cat_days']} days (~{result['cat_years']:.3f} years)")
+        print(f"Human equivalent: {result['human_days']} days (~{result['human_years']:.3f} years)")
+    except Exception as e:
+        print(f"Error: {e}")
+
+if __name__ == "__main__":
+    main()
